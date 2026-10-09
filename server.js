@@ -6,6 +6,7 @@ const authRoutes = require('./authRoutes');
 const chatRoutes = require('./chatRoutes');
 const adminRoutes = require('./adminRoutes');
 const paymentRoutes = require('./paymentRoutes');
+const modelsRoutes = require('./modelsRoutes');
 
 // جديد
 const imageRoutes = require('./imageRoutes');
@@ -36,6 +37,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api', chatRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/payment', paymentRoutes);
+app.use('/api/models', modelsRoutes);
 
 // جديد
 app.use('/api/images', imageRoutes);
