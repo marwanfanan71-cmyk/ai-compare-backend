@@ -3,7 +3,19 @@ const db = require('./database');
 const { requireAuth } = require('./authMiddleware');
 
 const router = express.Router();
+
 const TRIAL_DAYS = parseInt(process.env.TRIAL_DAYS || '7', 10);
+// سقف يومي ضد الاستغلال (ماشي حد تجاري): التجربة كاتبقى "بلا حدود" للمستخدم العادي
+const TRIAL_CHAT_HARD_LIMIT = parseInt(process.env.TRIAL_CHAT_HARD_LIMIT || '150', 10);
+const PREMIUM_CHAT_HARD_LIMIT = parseInt(process.env.PREMIUM_CHAT_HARD_LIMIT || '1000', 10);
+const MAX_PROMPT_CHARS = 20000;   // الفرونت كيرسل حتى ~14000 + التعليمات
+const OPENROUTER_TIMEOUT_MS = 55000;
+
+// مسموح غير النماذج المجانية: وإلا أي مستخدم يقدر يطلب نموذج مدفوع على حسابك فـ OpenRouter
+const FREE_MODEL_RE = /^[A-Za-z0-9._\-\/]{1,100}:free$/;
+function isAllowedModel(model) {
+  return typeof model === 'string' && (model === 'openrouter/free' || FREE_MODEL_RE.test(model));
+}
 
 function getTrialStatus(createdAt) {
   const createdDate = new Date(createdAt);
@@ -28,13 +40,24 @@ router.get('/usage', requireAuth, async (req, res) => {
       unlimited: isPremium || trial.inTrial
     });
   } catch (err) {
+    console.error('usage error:', err.message);
     res.status(500).json({ error: 'وقع مشكل فالسيرفر' });
   }
 });
 
 router.post('/chat', requireAuth, async (req, res) => {
-  const { model, prompt } = req.body;
+  const { model, prompt } = req.body || {};
   if (!model || !prompt) return res.status(400).json({ error: 'خاص model و prompt' });
+  if (typeof prompt !== 'string') return res.status(400).json({ error: 'الطلب غير صالح' });
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    return res.status(400).json({ error: 'النص طويل بزاف، قصرو شوية' });
+  }
+  if (!isAllowedModel(model)) {
+    return res.status(400).json({ error: 'هاد النموذج ماشي مسموح' });
+  }
+
+  let reserved = false;
+  const today = new Date().toISOString().split('T')[0];
 
   try {
     const result = await db.query('SELECT is_premium, created_at FROM users WHERE id = $1', [req.userId]);
@@ -42,173 +65,85 @@ router.post('/chat', requireAuth, async (req, res) => {
     if (!user) return res.status(401).json({ error: 'الحساب ماعادش موجود، عاود سجل الدخول' });
     const isPremium = !!user.is_premium;
     const trial = getTrialStatus(user.created_at);
-    const hasAccess = isPremium || trial.inTrial;
 
-    if (!hasAccess) {
+    if (!isPremium && !trial.inTrial) {
       return res.status(429).json({
         error: 'خلصات التجربة المجانية ديالك (' + TRIAL_DAYS + ' أيام). اشترك باش تكمل تستعمل الموقع بلا حدود.',
         trial_ended: true
       });
     }
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + process.env.OPENROUTER_API_KEY
-      },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 1500
-      })
-    });
-    const data = await response.json();
-    if (data.error) return res.status(502).json({ error: data.error.message });
-
-    const today = new Date().toISOString().split('T')[0];
-    await db.query(`
+    // حجز ذري للحصة: ما كاين غلط حتى لو جاو طلبات بزاف فنفس اللحظة
+    const cap = isPremium ? PREMIUM_CHAT_HARD_LIMIT : TRIAL_CHAT_HARD_LIMIT;
+    const reserve = await db.query(`
       INSERT INTO usage_log (user_id, date, count) VALUES ($1, $2, 1)
       ON CONFLICT (user_id, date) DO UPDATE SET count = usage_log.count + 1
-    `, [req.userId, today]);
+      WHERE usage_log.count < $3
+      RETURNING count
+    `, [req.userId, today, cap]);
 
-    res.json({ text: data.choices?.[0]?.message?.content || 'ما جاش جواب' });
-  } catch (err) {
-    res.status(500).json({ error: 'خطأ فـ الاتصال بـ OpenRouter: ' + err.message });
-  }
-});
-
-// ---------- توليد الصور (Pollinations، بلا مفتاح API) ----------
-const IMAGE_FALLBACK_MODELS = [
-  { id: 'flux', label: 'Flux' },
-  { id: 'turbo', label: 'Turbo' }
-];
-
-// كاش بسيط لقائمة النماذج باش ما نسولوش Pollinations فكل زيارة للصفحة
-let imageModelsCache = { data: null, at: 0 };
-const IMAGE_MODELS_TTL = 60 * 60 * 1000; // ساعة
-
-const POLLINATIONS_REFERRER = process.env.POLLINATIONS_REFERRER || 'usequerymix.com';
-
-// مسار تجريبي مؤقت للتشخيص فقط — كتقدر تفتحو مباشرة فالمتصفح بلا تسجيل دخول
-// امسحو من بعد ما نحلو المشكل
-router.get('/image/test', async (req, res) => {
-  try {
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent('a red apple')}` +
-      `?model=flux&width=512&height=512&seed=1&nologo=true&referrer=${encodeURIComponent(POLLINATIONS_REFERRER)}`;
-    const imgHeaders = { 'Referer': `https://${POLLINATIONS_REFERRER}/` };
-    if (process.env.POLLINATIONS_TOKEN) imgHeaders['Authorization'] = 'Bearer ' + process.env.POLLINATIONS_TOKEN;
-
-    const r = await fetch(url, { headers: imgHeaders });
-    const ct = r.headers.get('content-type') || '';
-    if (!r.ok || !ct.startsWith('image/')) {
-      const body = await r.text().catch(() => '');
-      return res.json({ ok: false, status: r.status, contentType: ct, body: body.slice(0, 500) });
-    }
-    const buf = Buffer.from(await r.arrayBuffer());
-    res.set('Content-Type', ct);
-    res.send(buf);
-  } catch (err) {
-    res.json({ ok: false, crashed: true, message: err.message });
-  }
-});
-
-router.get('/image/models', async (req, res) => {
-  try {
-    if (imageModelsCache.data && Date.now() - imageModelsCache.at < IMAGE_MODELS_TTL) {
-      return res.json({ models: imageModelsCache.data });
-    }
-
-    const response = await fetch('https://image.pollinations.ai/models', {
-      headers: { 'Referer': `https://${POLLINATIONS_REFERRER}/` }
-    });
-    const raw = await response.json();
-
-    // الاستجابة عادة جدول من الأسماء (strings)، تنحولوها لكائنات {id, label}
-    const list = Array.isArray(raw) ? raw : (raw.models || []);
-    let models = list
-      .map(m => {
-        const id = typeof m === 'string' ? m : m.id || m.name;
-        if (!id) return null;
-        const label = id.charAt(0).toUpperCase() + id.slice(1).replace(/[-_]/g, ' ');
-        return { id, label };
-      })
-      .filter(Boolean);
-
-    if (!models.length) throw new Error('empty models list');
-
-    imageModelsCache = { data: models, at: Date.now() };
-    res.json({ models });
-  } catch (err) {
-    // إلا تعطل Pollinations، نرجعو قائمة احتياطية باش الأداة تبقى خدامة
-    res.json({ models: IMAGE_FALLBACK_MODELS });
-  }
-});
-
-router.post('/image', requireAuth, async (req, res) => {
-  const { model, prompt, width, height } = req.body;
-  if (!model || !prompt) return res.status(400).json({ error: 'خاص model و prompt' });
-
-  const w = Math.min(Math.max(parseInt(width, 10) || 1024, 256), 1536);
-  const h = Math.min(Math.max(parseInt(height, 10) || 1024, 256), 1536);
-
-  try {
-    const result = await db.query('SELECT is_premium, created_at FROM users WHERE id = $1', [req.userId]);
-    const user = result.rows[0];
-    if (!user) return res.status(401).json({ error: 'الحساب ماعادش موجود، عاود سجل الدخول' });
-    const isPremium = !!user.is_premium;
-    const trial = getTrialStatus(user.created_at);
-    const hasAccess = isPremium || trial.inTrial;
-
-    if (!hasAccess) {
+    if (reserve.rowCount === 0) {
       return res.status(429).json({
-        error: 'خلصات التجربة المجانية ديالك (' + TRIAL_DAYS + ' أيام). اشترك باش تكمل تستعمل الموقع بلا حدود.',
-        trial_ended: true
+        error: 'وصلتي للسقف اليومي (' + cap + ' طلب). عاود جرب غدا.',
+        limit_reached: true
       });
     }
-
-    const seed = Math.floor(Math.random() * 1e9);
-    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}` +
-      `?model=${encodeURIComponent(model)}&width=${w}&height=${h}&seed=${seed}&nologo=true` +
-      `&referrer=${encodeURIComponent(POLLINATIONS_REFERRER)}`;
-
-    const imgHeaders = { 'Referer': `https://${POLLINATIONS_REFERRER}/` };
-    if (process.env.POLLINATIONS_TOKEN) {
-      imgHeaders['Authorization'] = 'Bearer ' + process.env.POLLINATIONS_TOKEN;
-    }
+    reserved = true;
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000);
-    let imgResponse;
+    const timeoutId = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
+    let response, data;
     try {
-      imgResponse = await fetch(url, { headers: imgHeaders, signal: controller.signal });
+      response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + process.env.OPENROUTER_API_KEY
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 1500
+        }),
+        signal: controller.signal
+      });
+      data = await response.json().catch(() => ({}));
     } finally {
       clearTimeout(timeoutId);
     }
-    const contentType = imgResponse.headers.get('content-type') || '';
 
-    if (!imgResponse.ok || !contentType.startsWith('image/')) {
-      // كنسجلو التفاصيل فـ logs ديال Render، وكنرجعوها ليك مباشرة هنا مؤقتاً باش نشخصو بسرعة
-      const bodyPreview = await imgResponse.text().catch(() => '');
-      console.error('Pollinations image error:', imgResponse.status, contentType, bodyPreview.slice(0, 300));
-      return res.status(502).json({
-        error: `تعذّر توليد الصورة — status:${imgResponse.status} type:${contentType || 'none'} body:${bodyPreview.slice(0, 200) || 'فارغ'}`
-      });
+    const text = data && data.choices && data.choices[0] && data.choices[0].message
+      ? data.choices[0].message.content : null;
+
+    if (!response.ok || data.error || !text) {
+      // ما كنحسبوش المحاولة الفاشلة على المستخدم
+      await releaseReservation(req.userId, today);
+      reserved = false;
+      const upstream = data && data.error && data.error.message ? String(data.error.message).slice(0, 200) : '';
+      console.error('OpenRouter error:', response.status, model, upstream);
+      return res.status(502).json({ error: upstream || 'النموذج ما جاوبش، جرب نموذج آخر' });
     }
 
-    const buffer = Buffer.from(await imgResponse.arrayBuffer());
-
-    const today = new Date().toISOString().split('T')[0];
-    await db.query(`
-      INSERT INTO usage_log (user_id, date, count) VALUES ($1, $2, 1)
-      ON CONFLICT (user_id, date) DO UPDATE SET count = usage_log.count + 1
-    `, [req.userId, today]);
-
-    res.set('Content-Type', contentType);
-    res.send(buffer);
+    res.json({ text });
   } catch (err) {
-    res.status(500).json({ error: 'خطأ فـ الاتصال بخدمة توليد الصور: ' + err.message });
+    if (reserved) await releaseReservation(req.userId, today);
+    const timedOut = err && err.name === 'AbortError';
+    console.error('chat error:', err.message);
+    res.status(timedOut ? 504 : 500).json({
+      error: timedOut ? 'النموذج تأخر بزاف، جرب نموذج آخر' : 'وقع مشكل فالسيرفر، عاود جرب'
+    });
   }
 });
+
+async function releaseReservation(userId, date) {
+  try {
+    await db.query(
+      'UPDATE usage_log SET count = GREATEST(count - 1, 0) WHERE user_id = $1 AND date = $2',
+      [userId, date]
+    );
+  } catch (e) {
+    console.error('release error:', e.message);
+  }
+}
 
 module.exports = router;
